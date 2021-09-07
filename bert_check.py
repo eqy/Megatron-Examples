@@ -1,4 +1,4 @@
-
+import time
 
 import torch
 
@@ -27,7 +27,7 @@ from megatron.mpu.utils import VocabUtility
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 EASY_MODE = False
 
 torch.manual_seed(42)
@@ -109,6 +109,7 @@ lr_scheduler = AnnealingLR(
 
 loss_sum = 0.0
 
+start_time = time.time()
 for i in range(5000000//BATCH_SIZE):
     generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
     # rng can be dangerous
@@ -154,3 +155,6 @@ for i in range(5000000//BATCH_SIZE):
         preds = torch.argmax(all_vocab, dim=2) * loss_mask
         cleaned = data * torch.logical_not(loss_mask)
         printtensor((cleaned + preds)[:2,:])
+        # assumes printing has effectively caused a CUDA synchronize
+        curr_elapsed = time.time() - start_time
+        print_rank_0(f"{(i+1)*BATCH_SIZE/curr_elapsed} samples/sec")
