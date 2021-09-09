@@ -1,7 +1,10 @@
-import time
 
 import torch
 
+import time
+
+
+from megatron import get_args
 from megatron.model import Float16Module
 from megatron.optimizer import get_megatron_optimizer 
 from megatron.utils import unwrap_model
@@ -22,13 +25,12 @@ from megatron import print_rank_0
 from megatron.mpu.initialize import get_tensor_model_parallel_group, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from megatron.mpu.utils import VocabUtility
 
-# "fancy" data
-
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 256
-EASY_MODE = False
+BATCH_SIZE = 128
+EASY_MODE = True
+STEPS = 5000000
 
 torch.manual_seed(42)
 
@@ -69,7 +71,7 @@ def generate_fancy_data_labels(sequence_len, batch_size):
        data_idx = 0
        inds = torch.randperm(effective_length)
      if EASY_MODE:
-       data_idx = data_idx % 5
+       data_idx = data_idx % 64
      offset = inds[data_idx] #* SEQUENCE_LEN
      data_idx += 1
       
@@ -82,56 +84,115 @@ def generate_fancy_data_labels(sequence_len, batch_size):
   label = temp
   return data, label, mask_not
 
+def generate_toy_data_labels(sequence_len, batch_size):
+  start = 64
+  end = 96
+  temp = torch.randint(start, end, (batch_size, sequence_len))
+  mask = (torch.rand(batch_size, sequence_len) >= MASK_PROB).long()
+  mask_not = torch.logical_not(mask)
+  data = mask * temp + mask_not*124
+  label = mask * temp + torch.max(temp)*mask_not
+  return data, label, mask_not
 
 initialize_megatron()
 global_vars._GLOBAL_ARGS.padded_vocab_size = VOCAB_SIZE
-bert = BertModel(num_tokentypes=0, add_binary_head=False)
-bert = bert.cuda()
+bert = [BertModel(num_tokentypes=0, add_binary_head=False, post_process=True)]
+
+
+bert[0] = bert[0].cuda()
+fp16 = bert[0].language_model.encoder._get_layer(0).self_attention.fp16
+bf16 = bert[0].language_model.encoder._get_layer(0).self_attention.bf16
+# even though args are saved in the model, we still need to do this...
+if fp16 or bf16:
+    bert[0] = Float16Module(bert[0], get_args())
+
+args = get_args()
+
+
+if args.DDP_impl == 'torch':
+    i = torch.cuda.current_device()
+    bert[0] = torchDDP(bert[0], device_ids=[i], output_device=i, process_group=mpu.get_data_parallel_group())
+else:
+    bert[0] = LocalDDP(bert[0], args.accumulate_allreduce_grads_in_fp32, True)
 
 unwrapped_model = unwrap_model(bert,
 			       (torchDDP, LocalDDP, Float16Module))
 
 # Turn on training mode which enables dropout.
-bert = bert.train()
-unwrapped_model = unwrapped_model.train()
+bert[0] = bert[0].train()
+unwrapped_model[0] = unwrapped_model[0].train()
 
-optimizer = get_megatron_optimizer([unwrapped_model])
+optimizer = get_megatron_optimizer(unwrapped_model)
+# check that this is an FP16 optimizer when args.fp16 is set...
+print(type(optimizer))
+
+max_lr=3e-4
+min_lr=3e-10
+warmup_steps=1000
+decay_steps=1000000
+
+# abandoned fp16 tuning for "fancy" data training
+if fp16:
+    nothing = None
+    #warmup_steps *= 100
+    #warmup_steps *= 10
+    #decay_steps *= 3
+    #max_lr = 3e1
+    #min_lr = 3e-2
+    #BATCH_SIZE *= 2
+    #STEPS *= 2
+    #min_lr /= 100
+    # max_lr *= 10
 
 lr_scheduler = AnnealingLR(
     optimizer,
-    max_lr=3e-4,
-    min_lr=3e-10,
-    warmup_steps=10000,
-    decay_steps=1000000,
+    max_lr=max_lr,
+    min_lr=min_lr,
+    warmup_steps=warmup_steps,
+    decay_steps=decay_steps,
     decay_style='linear',
     use_checkpoint_lr_scheduler=False,
     override_lr_scheduler=False)
 
 loss_sum = 0.0
 
+print_rank_0(f"fp16: {fp16}, bf16: {bf16}")
+
 start_time = time.time()
-for i in range(5000000//BATCH_SIZE):
-    generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
+# manually set postprocess to false to use loss criterion explicitly
+#bert[0].post_process = False
+for i in range(STEPS//BATCH_SIZE):
     # rng can be dangerous
-    data, label, loss_mask = generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
+    if args.fp16:
+      data, label, loss_mask = generate_toy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
+    else:
+      data, label, loss_mask = generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
 
     label = label.cuda()
     data = data.cuda()
     loss_mask= loss_mask.cuda()
+    # no padding in either toy or "fancy" data
     padding_mask = torch.ones_like(data, device='cuda')
-    # print(data.size(0))
-    # if i % 10 == 0:
-    #     print("iter", i, "I am rank", get_tensor_model_parallel_rank(), data[0, :5])
-    output_tensor, _ = bert(data, padding_mask, tokentype_ids=None, lm_labels=None)
-    output_clone = output_tensor.detach().clone()
-    all_vocab = torch.zeros(BATCH_SIZE, SEQUENCE_LEN, VOCAB_SIZE, device='cuda')
-    vocab_start_index, vocab_end_index = VocabUtility.vocab_range_from_per_partition_vocab_size(output_clone.size(-1), get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size())
 
-    all_vocab[:,:,vocab_start_index:vocab_end_index] = output_clone
-    torch.distributed.all_reduce(all_vocab, group=get_tensor_model_parallel_group())
+    # alternative version where we don't use megatron's "postprocessing" in models, which means that we do the loss calculation on our own 
+    output_tensor, _ = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
+    # lm_loss_ , _ = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=label)
+
+    # copy-pasted from Megatron train function
+    if args.DDP_impl == 'local':
+        for partition in bert:
+            partition.zero_grad_buffer()
     optimizer.zero_grad()
 
-    lm_loss_ = mpu.vocab_parallel_cross_entropy(output_tensor, label)
+    if args.DDP_impl == 'local':
+        bert[0].allreduce_gradients()
+
+    # fp16_lm_cross_entropy False by default, so we add a cast to float here
+    # used if we turn off postprocessing in the bert model
+    lm_loss_ = mpu.vocab_parallel_cross_entropy(output_tensor.float(), label)
+
+    lm_loss_ = lm_loss_.float()
+    loss_mask = loss_mask.float()
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
     lm_loss.backward()
@@ -139,22 +200,34 @@ for i in range(5000000//BATCH_SIZE):
     if update_successful:
         lr_scheduler.step(BATCH_SIZE)
     else:
+        # indicates NaNs in the gradients/loss
         print("update failed")
 
     curr_loss = lm_loss.detach().item()
     loss_sum += curr_loss
     if i % 100 == 0:
         s = 0.0
-        for key in unwrapped_model.state_dict():
-            s += torch.sum(bert.state_dict()[key])
+        # to "inspect" the model outputs, we run inference with lm_labels=None as this is the simplest way to get the model output
+        # when it is run with lm_labels, only the loss is returned, not the logits
+        output_tensor, _ = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
+        # gather the model output across the entire vocab (across other GPUs)
+        all_vocab = torch.zeros(BATCH_SIZE, SEQUENCE_LEN, VOCAB_SIZE, device='cuda')
+        vocab_start_index, vocab_end_index = VocabUtility.vocab_range_from_per_partition_vocab_size(output_tensor.size(-1), get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()) 
+        all_vocab[:,:,vocab_start_index:vocab_end_index] = output_tensor
+        torch.distributed.all_reduce(all_vocab, group=get_tensor_model_parallel_group())
+    
+        for key in bert[0].state_dict():
+            s += torch.sum(bert[0].state_dict()[key].float())
         print_rank_0([i, i*BATCH_SIZE, "LOSS:", curr_loss, "AVG LOSS:", loss_sum/(i+1)])
         print_rank_0(["vocab range", vocab_start_index, vocab_end_index])
         print_rank_0(all_vocab.shape)
+        print_rank_0(["param sum", s, "loss scale", optimizer.get_loss_scale()])
 
+        # show some examples in the output
         printtensor(data[:2,])
         preds = torch.argmax(all_vocab, dim=2) * loss_mask
         cleaned = data * torch.logical_not(loss_mask)
-        printtensor((cleaned + preds)[:2,:])
+        printtensor((cleaned + preds)[:2,:].long())
         # assumes printing has effectively caused a CUDA synchronize
         curr_elapsed = time.time() - start_time
         print_rank_0(f"{(i+1)*BATCH_SIZE/curr_elapsed} samples/sec")
