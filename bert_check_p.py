@@ -29,7 +29,7 @@ from megatron.mpu.utils import VocabUtility
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 128
+BATCH_SIZE = 512
 EASY_MODE = False 
 STEPS = 5000000
 
@@ -57,8 +57,14 @@ def printtensor(tensor):
       tmp = tensor[i]
       chars = [chr(tmp[i]) for i in range(len(tmp))]
       text = ''.join(chars)
-      print_rank_0(text)
-      print_rank_0('='*SEQUENCE_LEN)
+      print(text)
+      print('='*SEQUENCE_LEN)
+
+def post_processing(lm_output, labels):
+    output = lm_output
+    orig_output = output.clone().detach()
+    loss = mpu.vocab_parallel_cross_entropy(output, labels)
+    return loss, orig_output
 
 # build a batch given sequence_len and batch size
 def generate_fancy_data_labels(sequence_len, batch_size):
@@ -185,34 +191,49 @@ for i in range(STEPS//BATCH_SIZE):
     losses_reduced = []
 
     num_microbatches = BATCH_SIZE//args.micro_batch_size
-    print("num_microbatches: ", num_microbatches)
     # second pipeline stage gets input here, first gets input from data
     input_tensor = p2p_communication.recv_forward()
+
+    # rng can be dangerous
+    if args.fp16:
+      batch_data, batch_label, batch_loss_mask = generate_toy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
+    else:
+      batch_data, batch_label, batch_loss_mask = generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
+
+    batch_data = batch_data.reshape(batch_data.shape[0]//args.micro_batch_size,
+                                    args.micro_batch_size,
+                                    batch_data.shape[1])
+    batch_label = batch_label.reshape(batch_label.shape[0]//args.micro_batch_size,
+                                      args.micro_batch_size,
+                                      batch_label.shape[1])
+    batch_loss_mask = batch_loss_mask.reshape(batch_loss_mask.shape[0]//args.micro_batch_size,
+                                              args.micro_batch_size,
+                                              batch_loss_mask.shape[1])
     
     for ub in range(num_microbatches):
-        last_iteration = (i == (num_microbatches - 1))
+        last_iteration = (ub == (num_microbatches - 1))
 
-        # rng can be dangerous
-        if args.fp16:
-          data, label, loss_mask = generate_toy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
-        else:
-          data, label, loss_mask = generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
-   
+        data = batch_data[ub]
+        label = batch_label[ub]
+        loss_mask = batch_loss_mask[ub]
+
         label = label.cuda()
         data = data.cuda()
         loss_mask= loss_mask.cuda()
         # no padding in either toy or "fancy" data
         padding_mask = torch.ones_like(data, device='cuda')
-        print("my model.preprocess", bert[0].module.pre_process)
-        print("my model.postprocess", bert[0].module.post_process)
 
         # start of "forward_step function"
         unwrapped_model = unwrap_model(bert[0], (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.set_input_tensor(input_tensor)
-        output_tensor = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=label)
+
+        output_tensor = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
+        if mpu.is_pipeline_first_stage():
+            if i % 100 == 0 and ub == 0:
+                printtensor(data[:2,])
         if mpu.is_pipeline_last_stage():
-            print("hello")
             output_tensor, _ = output_tensor
+            output_tensor, orig_output = post_processing(output_tensor, label)
             lm_loss_ = output_tensor
             lm_loss_ = lm_loss_.float()
             loss_mask = loss_mask.float()
@@ -220,15 +241,18 @@ for i in range(STEPS//BATCH_SIZE):
                 lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
             prescale_loss = lm_loss / num_microbatches
             output_tensor = prescale_loss
-            print("PRESCALE LOSS:", prescale_loss)
+            if i % 100 == 0 and ub == 0:
+                preds = torch.argmax(orig_output, dim=2) * loss_mask
+                cleaned = data * torch.logical_not(loss_mask)
+                printtensor((cleaned + preds)[:2,:].long())
+                print("PRESCALE LOSS:", prescale_loss)
         # end of "forward_step function"
         output_tensor_grad = p2p_communication.send_forward_recv_backward(output_tensor)
 
         # no warmup, so we don't need this?
         # input_tensors.append(input_tensor)
         # output_tensors.append(output_tensor)
-
-        print("input tensor None?", input_tensor is None)
+        
         # start of "backward_step function"
         if input_tensor is not None:
             input_tensor.retain_grad()
@@ -256,33 +280,6 @@ for i in range(STEPS//BATCH_SIZE):
     else:
         # indicates NaNs in the gradients/loss
         print("update failed")
-    if mpu.is_pipeline_last_stage():
-        curr_loss = output_tensor.detach().item()
-        print("CURR LOSS", curr_loss)
-        #loss_sum += curr_loss
-        #if i % 100 == 0:
-        #    s = 0.0
-        #    # to "inspect" the model outputs, we run inference with lm_labels=None as this is the simplest way to get the model output
-        #    # when it is run with lm_labels, only the loss is returned, not the logits
-        #    output_tensor, _ = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
-        #    # gather the model output across the entire vocab (across other GPUs)
-        #    all_vocab = torch.zeros(BATCH_SIZE, SEQUENCE_LEN, VOCAB_SIZE, device='cuda')
-        #    vocab_start_index, vocab_end_index = VocabUtility.vocab_range_from_per_partition_vocab_size(output_tensor.size(-1), get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()) 
-        #    all_vocab[:,:,vocab_start_index:vocab_end_index] = output_tensor
-        #    torch.distributed.all_reduce(all_vocab, group=get_tensor_model_parallel_group())
-        #
-        #    for key in bert[0].state_dict():
-        #        s += torch.sum(bert[0].state_dict()[key].float())
-        #    print_rank_0([i, i*BATCH_SIZE, "LOSS:", curr_loss, "AVG LOSS:", loss_sum/(i+1)])
-        #    print_rank_0(["vocab range", vocab_start_index, vocab_end_index])
-        #    print_rank_0(all_vocab.shape)
-        #    print_rank_0(["param sum", s, "loss scale", optimizer.get_loss_scale()])
 
-        #    # show some examples in the output
-        #    printtensor(data[:2,])
-        #    preds = torch.argmax(all_vocab, dim=2) * loss_mask
-        #    cleaned = data * torch.logical_not(loss_mask)
-        #    printtensor((cleaned + preds)[:2,:].long())
-        #    # assumes printing has effectively caused a CUDA synchronize
-        #    curr_elapsed = time.time() - start_time
-        #    print_rank_0(f"{(i+1)*BATCH_SIZE/curr_elapsed} samples/sec")
+    if i % 100 == 0:
+        print((i+1)*BATCH_SIZE/(time.time() - start_time), "samples/sec")
