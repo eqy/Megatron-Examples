@@ -212,12 +212,14 @@ for i in range(STEPS//BATCH_SIZE):
         output_tensor = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=label)
         if mpu.is_pipeline_last_stage():
             print("hello")
+            output_tensor, _ = output_tensor
             lm_loss_ = output_tensor
             lm_loss_ = lm_loss_.float()
             loss_mask = loss_mask.float()
             lm_loss = torch.sum(
                 lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
             prescale_loss = lm_loss / num_microbatches
+            output_tensor = prescale_loss
             print("PRESCALE LOSS:", prescale_loss)
         # end of "forward_step function"
         output_tensor_grad = p2p_communication.send_forward_recv_backward(output_tensor)
@@ -248,39 +250,39 @@ for i in range(STEPS//BATCH_SIZE):
     # fp16_lm_cross_entropy False by default, so we add a cast to float here
     # used if we turn off postprocessing in the bert model
     # lm_loss_ = mpu.vocab_parallel_cross_entropy(output_tensor.float(), label)
-    raise Exception
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if update_successful:
         lr_scheduler.step(BATCH_SIZE)
     else:
         # indicates NaNs in the gradients/loss
         print("update failed")
+    if mpu.is_pipeline_last_stage():
+        curr_loss = output_tensor.detach().item()
+        print("CURR LOSS", curr_loss)
+        #loss_sum += curr_loss
+        #if i % 100 == 0:
+        #    s = 0.0
+        #    # to "inspect" the model outputs, we run inference with lm_labels=None as this is the simplest way to get the model output
+        #    # when it is run with lm_labels, only the loss is returned, not the logits
+        #    output_tensor, _ = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
+        #    # gather the model output across the entire vocab (across other GPUs)
+        #    all_vocab = torch.zeros(BATCH_SIZE, SEQUENCE_LEN, VOCAB_SIZE, device='cuda')
+        #    vocab_start_index, vocab_end_index = VocabUtility.vocab_range_from_per_partition_vocab_size(output_tensor.size(-1), get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()) 
+        #    all_vocab[:,:,vocab_start_index:vocab_end_index] = output_tensor
+        #    torch.distributed.all_reduce(all_vocab, group=get_tensor_model_parallel_group())
+        #
+        #    for key in bert[0].state_dict():
+        #        s += torch.sum(bert[0].state_dict()[key].float())
+        #    print_rank_0([i, i*BATCH_SIZE, "LOSS:", curr_loss, "AVG LOSS:", loss_sum/(i+1)])
+        #    print_rank_0(["vocab range", vocab_start_index, vocab_end_index])
+        #    print_rank_0(all_vocab.shape)
+        #    print_rank_0(["param sum", s, "loss scale", optimizer.get_loss_scale()])
 
-    curr_loss = lm_loss.detach().item()
-    loss_sum += curr_loss
-    if i % 100 == 0:
-        s = 0.0
-        # to "inspect" the model outputs, we run inference with lm_labels=None as this is the simplest way to get the model output
-        # when it is run with lm_labels, only the loss is returned, not the logits
-        output_tensor, _ = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
-        # gather the model output across the entire vocab (across other GPUs)
-        all_vocab = torch.zeros(BATCH_SIZE, SEQUENCE_LEN, VOCAB_SIZE, device='cuda')
-        vocab_start_index, vocab_end_index = VocabUtility.vocab_range_from_per_partition_vocab_size(output_tensor.size(-1), get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()) 
-        all_vocab[:,:,vocab_start_index:vocab_end_index] = output_tensor
-        torch.distributed.all_reduce(all_vocab, group=get_tensor_model_parallel_group())
-    
-        for key in bert[0].state_dict():
-            s += torch.sum(bert[0].state_dict()[key].float())
-        print_rank_0([i, i*BATCH_SIZE, "LOSS:", curr_loss, "AVG LOSS:", loss_sum/(i+1)])
-        print_rank_0(["vocab range", vocab_start_index, vocab_end_index])
-        print_rank_0(all_vocab.shape)
-        print_rank_0(["param sum", s, "loss scale", optimizer.get_loss_scale()])
-
-        # show some examples in the output
-        printtensor(data[:2,])
-        preds = torch.argmax(all_vocab, dim=2) * loss_mask
-        cleaned = data * torch.logical_not(loss_mask)
-        printtensor((cleaned + preds)[:2,:].long())
-        # assumes printing has effectively caused a CUDA synchronize
-        curr_elapsed = time.time() - start_time
-        print_rank_0(f"{(i+1)*BATCH_SIZE/curr_elapsed} samples/sec")
+        #    # show some examples in the output
+        #    printtensor(data[:2,])
+        #    preds = torch.argmax(all_vocab, dim=2) * loss_mask
+        #    cleaned = data * torch.logical_not(loss_mask)
+        #    printtensor((cleaned + preds)[:2,:].long())
+        #    # assumes printing has effectively caused a CUDA synchronize
+        #    curr_elapsed = time.time() - start_time
+        #    print_rank_0(f"{(i+1)*BATCH_SIZE/curr_elapsed} samples/sec")
