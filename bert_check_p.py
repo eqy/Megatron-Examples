@@ -29,9 +29,10 @@ from megatron.mpu.utils import VocabUtility
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 512
+BATCH_SIZE = 2048
 EASY_MODE = False 
 STEPS = 5000000
+PRINT_INTERVAL = 20
 
 torch.manual_seed(42)
 
@@ -229,7 +230,7 @@ for i in range(STEPS//BATCH_SIZE):
 
         output_tensor = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
         if mpu.is_pipeline_first_stage():
-            if i % 100 == 0 and ub == 0:
+            if i % PRINT_INTERVAL == 0 and ub == 0:
                 printtensor(data[:2,])
         if mpu.is_pipeline_last_stage():
             output_tensor, _ = output_tensor
@@ -241,7 +242,7 @@ for i in range(STEPS//BATCH_SIZE):
                 lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
             prescale_loss = lm_loss / num_microbatches
             output_tensor = prescale_loss
-            if i % 100 == 0 and ub == 0:
+            if i % PRINT_INTERVAL == 0 and ub == 0:
                 preds = torch.argmax(orig_output, dim=2) * loss_mask
                 cleaned = data * torch.logical_not(loss_mask)
                 printtensor((cleaned + preds)[:2,:].long())
@@ -281,5 +282,5 @@ for i in range(STEPS//BATCH_SIZE):
         # indicates NaNs in the gradients/loss
         print("update failed")
 
-    if i % 100 == 0:
+    if i % PRINT_INTERVAL == 0:
         print((i+1)*BATCH_SIZE/(time.time() - start_time), "samples/sec")
