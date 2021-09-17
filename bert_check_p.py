@@ -276,9 +276,8 @@ for i in range(STEPS//BATCH_SIZE):
 
     if i % PRINT_INTERVAL == 0:
         print((i+1)*BATCH_SIZE/(time.time() - start_time), "samples/sec")
-        if mpu.is_pipeline_first_stage():
-            printtensor(data[:2,])
         if mpu.is_pipeline_last_stage():
+            printtensor(data[:2,])
             preds = torch.argmax(orig_output, dim=2) * loss_mask
             cleaned = data * torch.logical_not(loss_mask)
             printtensor((cleaned + preds)[:2,:].long())
