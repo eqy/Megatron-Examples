@@ -29,13 +29,13 @@ from megatron.mpu.utils import VocabUtility
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 64
+BATCH_SIZE = 2048
 EASY_MODE = False
 EASY_MODE_SIZ = 32
 STEPS = 5000000
-PRINT_INTERVAL = 9
+PRINT_INTERVAL = 33
 MANUAL_SEED = 42
-DEBUG_PRINT = True
+DEBUG_PRINT = False
 NO_RUNAHEAD = False
 
 # download a public domain book as corpus
@@ -158,7 +158,7 @@ optimizer = get_megatron_optimizer(unwrapped_model)
 # check that this is an FP16 optimizer when args.fp16 is set...
 print(type(optimizer))
 
-max_lr=3e-5
+max_lr=3e-3
 min_lr=3e-10
 warmup_steps=1000
 decay_steps=1000000
@@ -234,11 +234,12 @@ for i in range(STEPS//BATCH_SIZE):
 
     if i % PRINT_INTERVAL == 0 and DEBUG_PRINT:
       print(i, "num runahead:", num_runahead_microbatches, "num microbatches:", num_microbatches)
+      print(i, "data checksum:", torch.sum(batch_data), "label checksum:", torch.sum(batch_label), "mask_checksum:", torch.sum(batch_loss_mask))
 
     data_ub_idx = 0
 
     # runahead to reduce pipeline stalls
-    for ub in range(num_runahead_microbatches):
+    for ub_runahead_warmup in range(num_runahead_microbatches):
         input_tensor = p2p_communication.recv_forward()
         recv_forward_count += 1
         data = batch_data[data_ub_idx]
@@ -268,8 +269,8 @@ for i in range(STEPS//BATCH_SIZE):
         recv_forward_count += 1
      
     for ub in range(num_runahead_microbatches, num_microbatches):
-        if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
-            print("rank", mpu.get_pipeline_model_parallel_rank(), ub)
+        #if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
+        #    print("rank", mpu.get_pipeline_model_parallel_rank(), ub)
         last_iteration = (ub == (num_microbatches - 1))
 
         data = batch_data[data_ub_idx]
@@ -284,9 +285,9 @@ for i in range(STEPS//BATCH_SIZE):
         unwrapped_model = unwrap_model(bert[0], (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.set_input_tensor(input_tensor)
         output_tensor = bert[0](data, padding_mask, tokentype_ids=None, lm_labels=None)
-        if DEBUG_PRINT and mpu.is_pipeline_first_stage() and i % PRINT_INTERVAL == 0:
-            print("first stage did inference on data:")
-            printtensor(data[:1,:])
+        #if DEBUG_PRINT and mpu.is_pipeline_first_stage() and i % PRINT_INTERVAL == 0:
+        #    print("first stage did inference on data:")
+        #    printtensor(data[:1,:])
         if mpu.is_pipeline_last_stage():
             output_tensor, _ = output_tensor
             output_tensor, orig_output = post_processing(output_tensor, label)
@@ -297,9 +298,9 @@ for i in range(STEPS//BATCH_SIZE):
                 lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
             prescale_loss = lm_loss / num_microbatches
             output_tensor = prescale_loss
-            if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
-                print("last stage did loss on label:", f"({data_ub_idx})")
-                printtensor(label[:1,:])
+            #if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
+            #    print("last stage did loss on label:", f"({data_ub_idx})")
+            #    printtensor(label[:1,:])
         # end of "forward_step function"
         output_tensor_grad = p2p_communication.send_forward_recv_backward(output_tensor)
         send_forward_count += 1
@@ -308,8 +309,8 @@ for i in range(STEPS//BATCH_SIZE):
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
 
-        input_tensor = input_tensors.pop()
-        output_tensor = output_tensors.pop()
+        input_tensor = input_tensors.pop(0)
+        output_tensor = output_tensors.pop(0)
         
         # start of "backward_step function"
         if input_tensor is not None:
@@ -321,11 +322,11 @@ for i in range(STEPS//BATCH_SIZE):
         if input_tensor is not None:
             input_tensor_grad = input_tensor.grad
         # end of "backward_step function"
-        if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
-            if input_tensor_grad is not None:
-                print("steady state grad sum:", torch.sum(input_tensor_grad))
-            else:
-                print("none in steady-state")
+        #if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
+        #    if input_tensor_grad is not None:
+        #        print("steady state grad sum:", torch.sum(input_tensor_grad))
+        #    else:
+        #        print("none in steady-state")
 
         if last_iteration:
             input_tensor = None
@@ -336,11 +337,11 @@ for i in range(STEPS//BATCH_SIZE):
             send_backward_count += 1
             recv_forward_count += 1
 
-    for ub in range(num_runahead_microbatches):
+    for ub_runahead_cooldown in range(num_runahead_microbatches):
         output_tensor_grad = p2p_communication.recv_backward()
         recv_backward_count += 1
-        input_tensor = input_tensors.pop()
-        output_tensor = output_tensors.pop()
+        input_tensor = input_tensors.pop(0)
+        output_tensor = output_tensors.pop(0)
 
         # start of "backward_step function"
         if input_tensor is not None:
@@ -352,11 +353,11 @@ for i in range(STEPS//BATCH_SIZE):
         if input_tensor is not None:
             input_tensor_grad = input_tensor.grad
         # end of "backward_step function"
-        if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
-            if input_tensor_grad is not None:
-                print("tail grad sum:", torch.sum(input_tensor_grad))
-            else:
-                print("none in tail")
+        #if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
+        #    if input_tensor_grad is not None:
+        #        print("tail grad sum:", torch.sum(input_tensor_grad))
+        #    else:
+        #        print("none in tail")
         p2p_communication.send_backward(input_tensor_grad)
         send_backward_count += 1
 
