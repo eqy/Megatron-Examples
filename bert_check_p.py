@@ -29,10 +29,10 @@ from megatron.mpu.utils import VocabUtility
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 EASY_MODE = False
 EASY_MODE_SIZ = 32
-STEPS = 5000000
+STEPS = 10000000
 PRINT_INTERVAL = 101
 MANUAL_SEED = 42
 DEBUG_PRINT = False
@@ -159,9 +159,9 @@ optimizer = get_megatron_optimizer(unwrapped_model)
 print(type(optimizer))
 
 max_lr=3e-4
-min_lr=3e-10
+min_lr=3e-12
 warmup_steps=1000
-decay_steps=1000000
+decay_steps=5000000
 
 # abandoned fp16 tuning for "fancy" data training
 if fp16:
