@@ -29,14 +29,20 @@ from megatron.mpu.utils import VocabUtility
 VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 EASY_MODE = False
 EASY_MODE_SIZ = 32
-STEPS = 5000000
+STEPS = 10000000
 PRINT_INTERVAL = 101
 MANUAL_SEED = 42
 DEBUG_PRINT = False
 NO_RUNAHEAD = False
+
+initialize_megatron()
+args = get_args()
+print("world size:", mpu.get_pipeline_model_parallel_world_size())
+print("rank:", mpu.get_pipeline_model_parallel_rank())
+print("is first", mpu.is_pipeline_first_stage(), "is last", mpu.is_pipeline_last_stage())
 
 # download a public domain book as corpus
 def download_fancy_data():
@@ -48,10 +54,12 @@ def download_fancy_data():
   ints = [int(encoded[i]) for i in range(len(encoded))]
   return torch.tensor(ints)
 
-fancy_data = download_fancy_data()
-print(fancy_data.size(0))
-effective_length = fancy_data.size(0) // SEQUENCE_LEN
-effective_length = fancy_data.size(0) - SEQUENCE_LEN
+if not args.fp16:
+    fancy_data = download_fancy_data()
+    print(fancy_data.size(0))
+    effective_length = fancy_data.size(0) // SEQUENCE_LEN
+    effective_length = fancy_data.size(0) - SEQUENCE_LEN
+
 inds = None
 masks = None
 data_idx = 0
@@ -84,7 +92,6 @@ def generate_fancy_data_labels(sequence_len, batch_size):
        inds = torch.randperm(effective_length, device='cuda')
        masks = (torch.rand(len(inds)//BATCH_SIZE + 1, BATCH_SIZE, SEQUENCE_LEN, device='cuda') >= MASK_PROB).long()
        MANUAL_SEED += 1
-
        print("new epoch", len(inds))
        data_idx = 0
        print("my start", inds[0:5])
@@ -105,17 +112,32 @@ def generate_fancy_data_labels(sequence_len, batch_size):
   label = temp
   return data, label, mask_not
 
+easy_data = None
+
 def generate_toy_data_labels(sequence_len, batch_size):
-  start = 64
-  end = 96
-  temp = torch.randint(start, end, (batch_size, sequence_len))
-  mask = (torch.rand(batch_size, sequence_len) >= MASK_PROB).long()
+  global data_idx
+  global easy_data
+  global masks
+  global MANUAL_SEED
+  if easy_data is None or data_idx >= easy_data.size(0):
+      start = 64
+      end = 96
+      torch.manual_seed(MANUAL_SEED)
+      easy_data = torch.randint(start, end, (STEPS//batch_size, batch_size, sequence_len), device='cuda')
+      masks = (torch.rand(STEPS//batch_size, batch_size, sequence_len, device='cuda') >= MASK_PROB).long()
+      MANUAL_SEED += 1
+      print("new epoch", len(easy_data))
+      data_idx = 0
+      print("my start", easy_data[:2, :2, :2])
+      print("masks_checksum:", torch.sum(masks))
+  temp = easy_data[data_idx]
+  mask = masks[data_idx]
+  data_idx += 1
   mask_not = torch.logical_not(mask)
   data = mask * temp + mask_not*124
   label = mask * temp + torch.max(temp)*mask_not
   return data, label, mask_not
 
-initialize_megatron()
 global_vars._GLOBAL_ARGS.padded_vocab_size = VOCAB_SIZE
 model = BertModel(num_tokentypes=0, add_binary_head=False,
                   pre_process=mpu.is_pipeline_first_stage(),
@@ -132,7 +154,6 @@ bf16 = bert[0].language_model.encoder._get_layer(0).self_attention.bf16
 if fp16 or bf16:
     bert[0] = Float16Module(bert[0], get_args())
 
-args = get_args()
 
 
 if args.DDP_impl == 'torch':
@@ -157,21 +178,20 @@ for model_module in unwrapped_model:
 optimizer = get_megatron_optimizer(unwrapped_model)
 # check that this is an FP16 optimizer when args.fp16 is set...
 print(type(optimizer))
+print(optimizer.grad_scaler)
 
 max_lr=3e-4
-min_lr=3e-10
+min_lr=3e-12
 warmup_steps=1000
-decay_steps=1000000
+decay_steps=5000000
 
 # abandoned fp16 tuning for "fancy" data training
 if fp16:
-    nothing = None
     #warmup_steps *= 100
     #warmup_steps *= 10
     #decay_steps *= 3
-    #max_lr = 3e1
-    #min_lr = 3e-2
     #BATCH_SIZE *= 2
+    BATCH_SIZE //= 2
     #STEPS *= 2
     #min_lr /= 100
     # max_lr *= 10
@@ -290,7 +310,7 @@ for i in range(STEPS//BATCH_SIZE):
         #    printtensor(data[:1,:])
         if mpu.is_pipeline_last_stage():
             output_tensor, _ = output_tensor
-            output_tensor, orig_output = post_processing(output_tensor, label)
+            output_tensor, orig_output = post_processing(output_tensor.float(), label)
             lm_loss_ = output_tensor
             lm_loss_ = lm_loss_.float()
             loss_mask = loss_mask.float()
@@ -385,7 +405,9 @@ for i in range(STEPS//BATCH_SIZE):
         lr_scheduler.step(BATCH_SIZE)
     else:
         # indicates NaNs in the gradients/loss
-        print("update failed")
+        if mpu.is_pipeline_last_stage():
+          print("update failed", loss_mask.sum(), torch.sum(lm_loss), grad_norm)
+
 
     if i % PRINT_INTERVAL == 0:
         if mpu.is_pipeline_last_stage():

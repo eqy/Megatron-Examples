@@ -129,7 +129,7 @@ print(type(optimizer))
 max_lr=3e-4
 min_lr=3e-10
 warmup_steps=1000
-decay_steps=1000000
+decay_steps=5000000
 
 # abandoned fp16 tuning for "fancy" data training
 if fp16:
