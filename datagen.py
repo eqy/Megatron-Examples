@@ -9,7 +9,7 @@ VOCAB_SIZE = 128
 SEQUENCE_LEN = 128
 MASK_PROB = 0.1
 BATCH_SIZE = 1024
-if os.environ['TENSOR_PARALLEL'] is not None:
+if 'TENSOR_PARALLEL' in os.environ:
     BATCH_SIZE = 128
 EASY_MODE = False
 EASY_MODE_SIZ = 32
