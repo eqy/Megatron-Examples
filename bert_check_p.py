@@ -26,15 +26,11 @@ from megatron import p2p_communication
 from megatron.mpu.initialize import get_tensor_model_parallel_group, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from megatron.mpu.utils import VocabUtility
 
-VOCAB_SIZE = 128
-SEQUENCE_LEN = 128
-MASK_PROB = 0.1
-BATCH_SIZE = 1024
-EASY_MODE = False
-EASY_MODE_SIZ = 32
+from datagen import generate_fancy_data_labels
+import datagen
+
 STEPS = 10000000
 PRINT_INTERVAL = 101
-MANUAL_SEED = 42
 DEBUG_PRINT = False
 NO_RUNAHEAD = False
 
@@ -44,33 +40,13 @@ print("world size:", mpu.get_pipeline_model_parallel_world_size())
 print("rank:", mpu.get_pipeline_model_parallel_rank())
 print("is first", mpu.is_pipeline_first_stage(), "is last", mpu.is_pipeline_last_stage())
 
-# download a public domain book as corpus
-def download_fancy_data():
-  import requests
-  response = requests.get('https://www.gutenberg.org/files/1342/1342-0.txt')
-  #response = requests.get('https://www.gutenberg.org/files/84/84-0.txt')
-  text = ' '.join(response.text.split())
-  encoded = text.encode('ascii', 'replace')
-  ints = [int(encoded[i]) for i in range(len(encoded))]
-  return torch.tensor(ints)
-
-if not args.fp16:
-    fancy_data = download_fancy_data()
-    print(fancy_data.size(0))
-    effective_length = fancy_data.size(0) // SEQUENCE_LEN
-    effective_length = fancy_data.size(0) - SEQUENCE_LEN
-
-inds = None
-masks = None
-data_idx = 0
-
 def printtensor(tensor):
   for i in range(tensor.size(0)):
       tmp = tensor[i]
       chars = [chr(tmp[i]) for i in range(len(tmp))]
       text = ''.join(chars)
       print(text)
-      print('='*SEQUENCE_LEN)
+      print('='*datagen.SEQUENCE_LEN)
 
 def post_processing(lm_output, labels):
     output = lm_output
@@ -78,67 +54,7 @@ def post_processing(lm_output, labels):
     loss = mpu.vocab_parallel_cross_entropy(output, labels)
     return loss, orig_output
 
-# build a batch given sequence_len and batch size
-def generate_fancy_data_labels(sequence_len, batch_size):
-  global data_idx
-  global inds
-  global masks
-  global MANUAL_SEED
-  temps = list()
-  for i in range(batch_size):
-     if inds is None or data_idx >= len(inds):
-       # hack as use of RNG will fall out of sync due to pipelines being different
-       torch.manual_seed(MANUAL_SEED)
-       inds = torch.randperm(effective_length, device='cuda')
-       masks = (torch.rand(len(inds)//BATCH_SIZE + 1, BATCH_SIZE, SEQUENCE_LEN, device='cuda') >= MASK_PROB).long()
-       MANUAL_SEED += 1
-       print("new epoch", len(inds))
-       data_idx = 0
-       print("my start", inds[0:5])
-       print("masks_checksum:", torch.sum(masks))
-     if EASY_MODE:
-       data_idx_ = data_idx % EASY_MODE_SIZ
-     else:
-       data_idx_ = data_idx
-     offset = inds[data_idx_] #* SEQUENCE_LEN
-     data_idx += 1
-      
-     curr = fancy_data[offset:offset+SEQUENCE_LEN].detach().clone()
-     temps.append(curr)
-  temp = torch.stack(temps, dim=0).cuda()
-  mask = masks[data_idx//BATCH_SIZE]
-  mask_not = torch.logical_not(mask)
-  data = mask * temp + mask_not*124
-  label = temp
-  return data, label, mask_not
-
-easy_data = None
-
-def generate_toy_data_labels(sequence_len, batch_size):
-  global data_idx
-  global easy_data
-  global masks
-  global MANUAL_SEED
-  if easy_data is None or data_idx >= easy_data.size(0):
-      start = 64
-      end = 96
-      torch.manual_seed(MANUAL_SEED)
-      easy_data = torch.randint(start, end, (STEPS//batch_size, batch_size, sequence_len), device='cuda')
-      masks = (torch.rand(STEPS//batch_size, batch_size, sequence_len, device='cuda') >= MASK_PROB).long()
-      MANUAL_SEED += 1
-      print("new epoch", len(easy_data))
-      data_idx = 0
-      print("my start", easy_data[:2, :2, :2])
-      print("masks_checksum:", torch.sum(masks))
-  temp = easy_data[data_idx]
-  mask = masks[data_idx]
-  data_idx += 1
-  mask_not = torch.logical_not(mask)
-  data = mask * temp + mask_not*124
-  label = mask * temp + torch.max(temp)*mask_not
-  return data, label, mask_not
-
-global_vars._GLOBAL_ARGS.padded_vocab_size = VOCAB_SIZE
+global_vars._GLOBAL_ARGS.padded_vocab_size = datagen.VOCAB_SIZE
 model = BertModel(num_tokentypes=0, add_binary_head=False,
                   pre_process=mpu.is_pipeline_first_stage(),
                   post_process=mpu.is_pipeline_last_stage())
@@ -185,17 +101,6 @@ min_lr=3e-12
 warmup_steps=1000
 decay_steps=5000000
 
-# abandoned fp16 tuning for "fancy" data training
-if fp16:
-    #warmup_steps *= 100
-    #warmup_steps *= 10
-    #decay_steps *= 3
-    #BATCH_SIZE *= 2
-    BATCH_SIZE //= 2
-    #STEPS *= 2
-    #min_lr /= 100
-    # max_lr *= 10
-
 lr_scheduler = AnnealingLR(
     optimizer,
     max_lr=max_lr,
@@ -214,7 +119,7 @@ print_rank_0(f"fp16: {fp16}, bf16: {bf16}")
 start_time = time.time()
 # manually set postprocess to false to use loss criterion explicitly
 #bert[0].post_process = False
-for i in range(STEPS//BATCH_SIZE):
+for i in range(STEPS//datagen.BATCH_SIZE):
     for partition in bert:
         partition.zero_grad_buffer()
     optimizer.zero_grad()
@@ -223,7 +128,7 @@ for i in range(STEPS//BATCH_SIZE):
     output_tensors = []
     losses_reduced = []
 
-    num_microbatches = BATCH_SIZE//args.micro_batch_size
+    num_microbatches = datagen.BATCH_SIZE//args.micro_batch_size
     # protocol debugging trackers
     send_forward_count = 0
     recv_forward_count = 0
@@ -231,11 +136,7 @@ for i in range(STEPS//BATCH_SIZE):
     recv_backward_count= 0
 
     # rng can be dangerous
-    if args.fp16:
-      batch_data, batch_label, batch_loss_mask = generate_toy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
-    else:
-      # print("GENERATING", i)
-      batch_data, batch_label, batch_loss_mask = generate_fancy_data_labels(SEQUENCE_LEN, BATCH_SIZE)
+    batch_data, batch_label, batch_loss_mask = generate_fancy_data_labels(datagen.SEQUENCE_LEN, datagen.BATCH_SIZE)
 
     batch_data = batch_data.reshape(batch_data.shape[0]//args.micro_batch_size,
                                     args.micro_batch_size,
@@ -402,7 +303,7 @@ for i in range(STEPS//BATCH_SIZE):
     # used if we turn off postprocessing in the bert model
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if update_successful:
-        lr_scheduler.step(BATCH_SIZE)
+        lr_scheduler.step(datagen.BATCH_SIZE)
     else:
         # indicates NaNs in the gradients/loss
         if mpu.is_pipeline_last_stage():
@@ -417,9 +318,9 @@ for i in range(STEPS//BATCH_SIZE):
             printtensor((cleaned + preds)[:2,:].long())
             print("LABEL")
             printtensor(label[:2, :])
-            print((i+1)*BATCH_SIZE, "UNSCALED LOSS:", lm_loss)
+            print((i+1)*datagen.BATCH_SIZE, "UNSCALED LOSS:", lm_loss)
         if mpu.is_pipeline_first_stage():
-            print((i+1)*BATCH_SIZE/(time.time() - start_time), "samples/sec")
+            print((i+1)*datagen.BATCH_SIZE/(time.time() - start_time), "samples/sec")
         if DEBUG_PRINT and i % PRINT_INTERVAL == 0:
             print(mpu.get_pipeline_model_parallel_rank(), {'send_forward_count':send_forward_count,
                                                            'recv_forward_count':recv_forward_count,
