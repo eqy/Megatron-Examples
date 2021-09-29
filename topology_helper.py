@@ -38,7 +38,8 @@ for i in range(num_pipeline_model_parallel_groups):
     # we want other ranks in the same stage corresponding, so step by... the number of ranks at the same stage
     ranks = range(i, world_size, num_pipeline_model_parallel_groups)
     group = [x for x in ranks]
-  pipeline_model_parallel_groups.append(group)
+    pipeline_model_parallel_groups.append(group)
+    print(group)
 
 for i in range(data_parallel_size):
     print("DATA PARALLEL", i)
